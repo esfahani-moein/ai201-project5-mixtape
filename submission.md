@@ -30,7 +30,7 @@ I used AI tools during this project primarily for codebase navigation and code c
 - **`routes/users.py`** — Endpoints for retrieving a user profile, getting a listening streak, listing notifications (with optional `unread_only` filter), and marking a notification as read.
 - **`routes/feed.py`** — Endpoints for "Friends Listening Now" and the general activity feed.
 - **`services/streak_service.py`** — `record_listening_event` creates a `ListeningEvent` and delegates to `update_listening_streak`, which increments or resets the user's streak based on the calendar day gap since their last listen.
-- **`services/feed_service.py`** — `get_friends_listening_now` filters friend listening events within the last 24 hours and deduplicates to one entry per friend. `get_activity_feed` returns the most recent N events from friends regardless of recency.
+- **`services/feed_service.py`** — `get_friends_listening_now` filters friend listening events within the last hour and deduplicates to one entry per friend. `get_activity_feed` returns the most recent N events from friends regardless of recency.
 - **`services/search_service.py`** — `search_songs` queries songs by title/artist (case-insensitive) and returns full song dicts including tags. `get_song` fetches a single song by ID.
 - **`services/notification_service.py`** — `create_notification` persists a notification. `add_to_playlist` adds a song to a playlist and notifies the original sharer. `rate_song` saves or updates a rating. `get_notifications` and `mark_as_read` handle retrieval and state changes.
 - **`services/playlist_service.py`** — `create_playlist`, `get_playlist_songs`, `get_playlist`, and `get_user_playlists`. The retrieval logic joins through `playlist_entries` to respect the explicit `position` ordering.
@@ -89,6 +89,22 @@ I changed the query from `.all()` to calling `.distinct()` before `.all()`, spec
 
 ---
 
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How you reproduced it**
+I wrote a new test in `tests/test_feed.py` that creates two listening events for a friend: one 10 minutes ago and one 3 hours ago. Before the fix, `get_friends_listening_now` returned both events because the threshold was 24 hours. After reducing the threshold, only the 10-minute event remains. I also reproduced it manually against the seeded database by calling `get_friends_listening_now` for user `nova` and observing that friends with 2-hour-old listens were included alongside the truly recent ones.
+
+**How you found the root cause**
+I read `services/feed_service.py` and noticed `RECENT_THRESHOLD = timedelta(hours=24)` at the module level. The `get_friends_listening_now` function computes `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` and then queries for events where `listened_at >= cutoff`. A 24-hour sliding window means anyone who listened within the last calendar day is shown. The endpoint is named "listening now," which semantically implies a much smaller window. Comparing this to the seed data confirmed the problem: the seed script deliberately places recent events at 10–20 minutes ago and older events at 2+ hours ago, with a comment stating the older ones "should NOT appear in 'listening now' after fix."
+
+**The root cause**
+The `RECENT_THRESHOLD` constant was set to 24 hours. In a feature called "Friends Listening Now," a 24-hour window is far too wide — it includes anyone who listened at any point yesterday, which is exactly the user complaint. The boundary condition is the threshold itself: any event from more than a few minutes or hours ago is treated as "now."
+
+**Your fix and side-effect check**
+I changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(hours=1)`. This narrows the window to a realistic "recently listening" range, excluding yesterday's events while preserving the truly recent ones. I wrote `tests/test_feed.py::test_listening_now_excludes_old_events` to lock in the correct behavior. I also verified that `get_activity_feed` (which does not use `RECENT_THRESHOLD` and instead returns the most recent N events regardless of time) was completely unaffected.
+
+---
+
 ### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
 
 **How you reproduced it**
@@ -125,19 +141,22 @@ I removed the `[:-1]` slice, changing the return statement to `[song.to_dict() f
 
 ---
 
-## Regression Test
+## Regression Tests
 
 For Issue #5 (last song missing), I wrote a regression test that would have caught the bug before it was introduced. The test already existed in the starter repo (`test_playlist_returns_all_songs`), but it was failing. After my fix, all playlist tests pass, including the existing ones that now serve as regression tests. The test `test_playlist_returns_all_songs` specifically asserts `len(songs) == 5` for a 5-song playlist — an assertion that fails when `[:-1]` incorrectly truncates the list.
 
-*(If a custom regression test is required beyond the existing ones, I also added a new test in `tests/test_playlists.py` named `test_playlist_with_one_song_returns_one_song` to guard the boundary case of a single-element playlist, where `[:-1]` would produce an empty list.)*
+I also added a new test in `tests/test_playlists.py` named `test_playlist_with_one_song_returns_one_song` to guard the boundary case of a single-element playlist, where `[:-1]` would produce an empty list.
+
+For Issue #2 (feed recency threshold), I added `tests/test_feed.py::test_listening_now_excludes_old_events` which verifies that a 3-hour-old listening event is excluded from "Friends Listening Now" while a 10-minute-old event is included. This test would fail under the old 24-hour threshold.
 
 ---
 
 ## Commit Log
 
 ```
-fix: remove erroneous Sunday boundary condition in streak reset logic
-fix: deduplicate search results after tag join with distinct()
-fix: notify original sharer when their song is rated by a friend
 fix: stop slicing off last song in get_playlist_songs return value
+fix: deduplicate search results after tag join with distinct()
+fix: remove erroneous Sunday boundary condition in streak reset logic
+fix: notify original sharer when their song is rated by a friend
+fix: reduce listening-now threshold from 24 hours to 1 hour
 ```
