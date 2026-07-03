@@ -84,3 +84,33 @@ def test_empty_playlist_returns_empty_list(app):
 
         songs = get_playlist_songs(playlist.id)
         assert songs == []
+
+
+def test_playlist_with_one_song_returns_one_song(app):
+    """A regression test: a single-song playlist must return exactly one song."""
+    with app.app_context():
+        user = User(username="solo", email="solo@example.com")
+        db.session.add(user)
+        db.session.flush()
+
+        song = Song(title="Solo Track", artist="One Hit", shared_by=user.id)
+        db.session.add(song)
+        db.session.flush()
+
+        playlist = Playlist(name="Solo Playlist", created_by=user.id)
+        db.session.add(playlist)
+        db.session.flush()
+
+        db.session.execute(
+            playlist_entries.insert().values(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=1,
+                added_by=user.id,
+            )
+        )
+        db.session.commit()
+
+        songs = get_playlist_songs(playlist.id)
+        assert len(songs) == 1
+        assert songs[0]["title"] == "Solo Track"
